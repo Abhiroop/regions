@@ -83,6 +83,18 @@ runSIO m = rbrace (liftIO (newIORef [])) after (runReaderT $ unIORT m)
 newtype SHandle (m :: * -> *) =
   SHandle Handle
 
+newtype SubRegion r s =
+  SubRegion (forall v . SIO r v -> SIO s v)
+-- SubRegion r s is witness that r is the ancestor of s
+
+newRgn :: (forall s . SubRegion r s -> SIO s v) -> SIO r v
+newRgn body
+  = IORT (do
+             env_outer <- ask
+             let witness (IORT m) =
+                   liftIO (runReaderT m env_outer)
+             liftIO (runSIO (body (SubRegion witness)))
+         )
 newSHandle :: FilePath -> IOMode -> SIO s (SHandle (SIO s))
 newSHandle fname fmode = IORT r'
   where

@@ -1,4 +1,3 @@
-{-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE RankNTypes #-}
@@ -8,9 +7,9 @@ module Memory where
 
 import Foreign.Marshal.Alloc
 import Foreign.Ptr
+import Foreign.Storable
 
 import Control.Exception
-import Control.Monad.ST
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.Reader
 import Data.IORef
@@ -76,24 +75,86 @@ runSIO m = rbrace (liftIO (newIORef [])) after (runReaderT $ unIORT m)
 
 newtype SPtr (m :: * -> *) a =
   SPtr (Ptr a)
+  deriving Eq
+
+newtype SubRegion r s a =
+  SubRegion (forall v . SIO r a v -> SIO s a v)
+
+-- SubRegion r s is witness that region r is the ancestor of region s in a region of type a
+
+newRgn :: (forall s . SubRegion r s a -> SIO s a v) -> SIO r a v
+newRgn body
+  = IORT $ do
+  env_outer <- ask
+  let witness (IORT m) = liftIO (runReaderT m env_outer)
+  liftIO (runSIO (body (SubRegion witness)))
 
 newMemBlock :: Int -> SIO s a (SPtr (SIO s a) a)
 newMemBlock bytes = IORT r'
   where
     r' = do
-      liftIO $ hPutStrLn stderr ("Allocating " ++ (show bytes) ++ " bytes")
       ptr <- liftIO $ mallocBytes bytes
+      liftIO $ hPutStrLn stderr ("Allocating pointer : " ++ (show ptr))
       handles <- ask
       liftIO $ modifyIORef handles (ptr:)
       return $ SPtr ptr
 
 
-shThrow :: Exception e => e -> SIO s a v
-shThrow = liftIO . throwIO
+ptrThrow :: Exception e => e -> SIO s a v
+ptrThrow = liftIO . throwIO
 
-shCatch :: Exception e => SIO s a v -> (e -> SIO s a v) -> SIO s a v
-shCatch = rcatch
+ptrCatch :: Exception e => SIO s a v -> (e -> SIO s a v) -> SIO s a v
+ptrCatch = rcatch
+
+readInt :: (SPtr (SIO s Int) Int) -> SIO s Int Int
+readInt (SPtr ptr) = liftIO $ peek ptr
+
+writeInt :: (SPtr (SIO s Int) Int) -> Int -> SIO s Int ()
+writeInt (SPtr ptr) = liftIO . poke ptr
+
+report :: String -> SIO s Int ()
+report = liftIO . hPutStr stderr
 
 foo = runSIO $ do
   x <- newMemBlock 10
+  writeInt x 50
+  j <- readInt x
+  --report (show j)
+  return j
+
+newNaiveReg :: (forall s . SIO s a v) -> SIO r a v
+newNaiveReg m = liftIO $ runSIO m
+
+-- bar = runSIO $ do
+--   x <- newMemBlock 10
+--   -- some computation in the memory
+--   m <- readInt x
+--   let op = newMemBlock 5
+--   res <- newNaiveReg (bar1 m op)
+--   return ()
+
+-- bar1 :: Int -> SIO s Int (SPtr (SIO s Int) Int) -> SIO s Int Int
+-- bar1 m op = do
+--   z <- newMemBlock 10
+--   h <- op
+--   --l1 <- readInt x
+--   j <- readInt z
+--   k <- readInt h
+--   return (m + j + k)
+
+bar = runSIO $ do
+  x <- newMemBlock 10
+  -- some computation in the memory
+  m <- readInt x
+  let op = newMemBlock 5
+  res <- newRgn (\(SubRegion witness) -> do
+                         z <- newMemBlock 10
+                         h <- op
+                         l1 <- witness $ readInt x
+                         j <- readInt z
+                         k <- readInt h
+                         return (m + j + k)
+                     )
   return ()
+
+
