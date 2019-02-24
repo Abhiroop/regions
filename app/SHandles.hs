@@ -1,5 +1,3 @@
-{-# LANGUAGE AllowAmbiguousTypes #-}
-{-# LANGUAGE IncoherentInstances #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FunctionalDependencies #-}
@@ -172,4 +170,4 @@ test3_internal h1 = do
        (shGetLine h2 >>= shPutStrLn h3 >>
         shGetLine h1 >>= shPutStrLn h3)
   shReport "Finished zipping h1 and h2"
-  return h3
+  return h2
