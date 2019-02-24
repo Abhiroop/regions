@@ -46,7 +46,7 @@ instance RMonadIO IO where
   liftIO = id
   rbrace = bracket
   rcatch = catch
-
+ 
 instance RMonadIO m => RMonadIO (ReaderT r m) where
   liftIO = lift . liftIO
   rbrace before after during =

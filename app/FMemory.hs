@@ -8,7 +8,7 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 
-module SMemory where
+module FMemory where
 
 import Foreign.Marshal.Alloc
 import Foreign.Ptr
@@ -19,14 +19,34 @@ import Control.Monad
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.Reader
 import Data.IORef
+import Data.List (find)
 import System.IO
 
 
 newtype IORT s m a v = IORT
-  { unIORT :: ReaderT (IORef [Ptr a]) m v
+  { unIORT :: ReaderT (IORef [PtrR a]) m v
   } deriving (Functor, Applicative, Monad)
 
 type SIO s = IORT s IO
+
+data PtrR a = PtrR (Ptr a) (IORef Integer)
+
+free_ptr :: PtrR a -> IO ()
+free_ptr (PtrR ptr refcount) = do
+    hPutStrLn stderr $ "Freeing " ++ show ptr
+    rc <- readIORef refcount
+    assert (rc > 0) (return ())
+    writeIORef refcount (pred rc)
+    if rc > 1
+       then hPutStrLn stderr "Aliased pointer wasn't closed"
+       else free ptr
+
+new_ptr :: Ptr a -> IO (PtrR a)
+new_ptr ptr = newIORef 1 >>= return . PtrR ptr
+
+eq_ptr :: Ptr a -> PtrR a -> Bool
+eq_ptr ptr1 (PtrR ptr2 _) = ptr1 == ptr2
+
 
 class Monad m => RMonadIO m where
   liftRIO :: IO a -> m a
@@ -81,9 +101,8 @@ newRgn body
       ptrs <- readIORef pointers
       mapM_ freeMem ptrs
     freeMem ptr = do
-      hPutStrLn stderr ("Freeing " ++ show ptr)
       catch
-        (free ptr)
+        (free_ptr ptr)
         (\(e :: SomeException) -> do
            hPutStrLn stderr ("Exception while freeing: " ++ show e)
            return ())
@@ -97,16 +116,16 @@ liftSIO :: Monad m
         -> IORT s (IORT r m a) a v
 liftSIO = IORT . lift
 
-type Bytes = Int
 
-newMemBlock :: RMonadIO m => Bytes -> IORT s m a (SPtr (IORT s m a) a)
+newMemBlock :: RMonadIO m => Int -> IORT s m a (SPtr (IORT s m a) a)
 newMemBlock bytes = IORT r'
   where
     r' = do
       ptr <- liftRIO $ mallocBytes bytes
       liftRIO $ hPutStrLn stderr ("Allocating pointer : " ++ (show ptr))
-      handles <- ask
-      liftRIO $ modifyIORef handles (ptr:)
+      pointers <- ask
+      ptr' <- liftRIO $ new_ptr ptr
+      liftRIO $ modifyIORef pointers (ptr':)
       return $ SPtr ptr
 
 -- mimics implicit region subtyping
@@ -123,22 +142,37 @@ instance {-# OVERLAPPABLE #-} (Monad m1, Monad m2, m2 ~ (IORT s x a), MonadRaise
   lifts = IORT . lift . lifts
 
 
+-- mp is the parent region monad
+copyPtr
+  :: (RMonadIO m1, mp ~ IORT s' m1)
+  => SPtr (IORT s m a) a
+  -> IORT s (mp a) a (SPtr m a)
+copyPtr (SPtr p) = IORT $ do
+  pointers <- ask >>= liftRIO . readIORef
+  let Just ptr@(PtrR _ refcount) = find (eq_ptr p) pointers
+  liftRIO $ modifyIORef refcount succ
+  lift $ IORT (do -- in the parent monad
+                  pointers <- ask
+                  liftRIO $ modifyIORef pointers (ptr:))
+  return (SPtr p)
+
+
 ptrThrow :: (Exception e, RMonadIO m) => e -> m a
 ptrThrow = liftRIO . throwIO
 
 ptrCatch :: (Exception e, RMonadIO m) => m a -> (e -> m a) -> m a
 ptrCatch = rcatch
 
-readMem :: (MonadRaise m1 m2, RMonadIO m2, Storable a) => SPtr m1 a -> m2 a
-readMem (SPtr ptr) = liftRIO $ peek ptr
+readInt :: (MonadRaise m1 m2, RMonadIO m2) => SPtr m1 Int -> m2 Int
+readInt (SPtr ptr) = liftRIO $ peek ptr
 
-writeMem :: (MonadRaise m1 m2, RMonadIO m2, Storable a) => SPtr m1 a -> a -> m2 ()
-writeMem (SPtr ptr) = liftRIO . poke ptr
+writeInt :: (MonadRaise m1 m2, RMonadIO m2) => SPtr m1 Int -> Int -> m2 ()
+writeInt (SPtr ptr) = liftRIO . poke ptr
 
 report :: (RMonadIO m) => String -> m ()
 report = liftRIO . hPutStr stderr
 
-boundaryOf :: (MonadRaise m1 m2, RMonadIO m2) => SPtr m1 Int -> m2 Bool
+boundaryOf :: (MonadRaise m1 m2, RMonadIO m2, Storable a) => SPtr m1 a -> m2 Bool
 boundaryOf (SPtr a) = liftRIO (return True)
 
 
@@ -156,7 +190,7 @@ test3 = runSIO (do
   ptr1 <- newMemBlock 10
   ptr3 <- newRgn (test3_internal ptr1)
   till (boundaryOf ptr1)
-       (readMem ptr1 >>= writeMem ptr3)
+       (readInt ptr1 >>= writeInt ptr3)
   report "test3 done")
 
 
@@ -167,15 +201,34 @@ till condition iteration = loop where
 
 test3_internal ptr1 = do
   ptr2 <- newMemBlock 10
-  int2 <- readMem ptr2
+  int2 <- readInt ptr2
   ptr3 <- liftSIO (newMemBlock 10)                           -- In this case we statically know that we want ptr3 to outlive this region
-  writeMem ptr3 int2
+  writeInt ptr3 int2
   till (liftM2 (||) (boundaryOf ptr2) (boundaryOf ptr1))
-       (readMem ptr2 >>= writeMem ptr3 >>
-        readMem ptr1 >>= writeMem ptr3)
+       (readInt ptr2 >>= writeInt ptr3 >>
+        readInt ptr1 >>= writeInt ptr3)
   report "with ptr1 and ptr2"
   return ptr3
 
 
 -- What if we statically don't know what we want to outlive?
 -- Eg : we have 2 child regions RC1 and RC2 and depending on some computation we want to return either of the 2 regions and kill the other 
+
+test5 = runSIO (do
+  h <- newRgn (test5_internal 20)
+  l <- readInt h
+  report ("Continue with the older mem block: " ++ show l)
+  report "test5 done")
+
+test5_internal conf_fname = do
+  hc <- newMemBlock conf_fname
+  fname1 <- readInt hc
+  fname2 <- readInt hc
+  h1 <- newMemBlock fname1
+  h2 <- newMemBlock fname2
+  l1 <- readInt h1
+  l2 <- readInt h2
+  let (fname_old,h_old) | l1 < l2 = (fname2,h2)
+                        | otherwise = (fname1,h1)
+  report ("Older mem block: " ++ (show fname_old))
+  copyPtr h_old -- prolong the life of that handle

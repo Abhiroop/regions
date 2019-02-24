@@ -17,15 +17,35 @@ import Control.Monad
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.Reader
 import Data.IORef
+import Data.List (find)
 import System.IO
 
 import Data.STRef
 
 newtype IORT s m v = IORT
-  { unIORT :: ReaderT (IORef [Handle]) m v
+  { unIORT :: ReaderT (IORef [HandleR]) m v
   } deriving (Functor, Applicative, Monad)
 
 type SIO s = IORT s IO
+
+
+data HandleR = HandleR Handle (IORef Integer)
+
+close_hr :: HandleR -> IO ()
+close_hr (HandleR h refcount) = do
+    hPutStrLn stderr $ "Closing " ++ show h
+    rc <- readIORef refcount
+    assert (rc > 0) (return ())
+    writeIORef refcount (pred rc)
+    if rc > 1
+       then hPutStrLn stderr "Aliased handle wasn't closed"
+       else hClose h
+
+new_hr :: Handle -> IO HandleR
+new_hr h = newIORef 1 >>= return . HandleR h
+
+eq_hr :: Handle -> HandleR -> Bool
+eq_hr h1 (HandleR h2 _) = h1 == h2
 
 class Monad m => RMonadIO m where
   liftIO :: IO a -> m a
@@ -90,13 +110,11 @@ newRgn m
     after handles = liftIO $ do
       hs <- readIORef handles
       mapM_ close hs
-    close h = do
-      hPutStrLn stderr ("Closing " ++ show h)
-      catch
-        (hClose h)
-        (\(e :: SomeException) -> do
-           hPutStrLn stderr ("Exception while closing: " ++ show e)
-           return ())
+    close h = catch
+              (close_hr h)
+              (\(e :: SomeException) -> do
+                  hPutStrLn stderr ("Exception while closing: " ++ show e)
+                  return ())
 
 runSIO :: (forall s. SIO s v) -> IO v
 runSIO = newRgn
@@ -109,7 +127,8 @@ newSHandle fname fmode = IORT r'
     r' = do
       h <- liftIO $ openFile fname fmode
       handles <- ask
-      liftIO $ modifyIORef handles (h:)
+      hr <- liftIO $ new_hr h
+      liftIO $ modifyIORef handles (hr:)
       return $ SHandle h
 
 
@@ -128,6 +147,16 @@ instance {-# OVERLAPPABLE #-} Monad m => MonadRaise m m where
 instance {-# OVERLAPPABLE #-} (Monad m1, Monad m2, m2 ~ (IORT s x), MonadRaise m1 x) => MonadRaise m1 m2 where
   lifts = IORT . lift . lifts
 
+shDup :: (m ~ (IORT s' m'), RMonadIO m, Monad m', RMonadIO m') =>
+         SHandle (IORT s1 m) -> IORT s1 m (SHandle m)
+shDup (SHandle h) = IORT $ do
+  handles <- ask >>= liftIO . readIORef
+  let Just hr@(HandleR _ refcount) = find (eq_hr h) handles
+  liftIO $ modifyIORef refcount succ
+  lift $ IORT (do -- in the parent monad
+                  handles <- ask
+                  liftIO $ modifyIORef handles (hr:))
+  return (SHandle h)
 
 shThrow :: (Exception e, RMonadIO m) => e -> m a
 shThrow = liftIO . throwIO
@@ -147,27 +176,26 @@ shPutStrLn (SHandle h) = liftIO . hPutStrLn h
 shIsEOF :: (MonadRaise m1 m2, RMonadIO m2) => SHandle m1 -> m2 Bool
 shIsEOF (SHandle h) = liftIO (hIsEOF h)
 
-
 test3 = runSIO (do
   h1 <- newSHandle "/tmp/SafeHandles.hs" ReadMode
-  h3 <- test3_internal h1
+  h3 <- newRgn (test3_internal h1)
   till (shIsEOF h1)
        (shGetLine h1 >>= shPutStrLn h3)
   shReport "test3 done")
-
 
 till condition iteration = loop where
   loop = do b <- condition
             if b then return ()
                  else iteration >> loop
 
+
 test3_internal h1 = do
   h2 <- newSHandle "/tmp/ex-file.conf" ReadMode
   fname <- shGetLine h2
-  h3 <- newSHandle fname WriteMode
+  h3 <- liftSIO (newSHandle fname WriteMode)
   shPutStrLn h3 fname
   till (liftM2 (||) (shIsEOF h2) (shIsEOF h1))
        (shGetLine h2 >>= shPutStrLn h3 >>
         shGetLine h1 >>= shPutStrLn h3)
   shReport "Finished zipping h1 and h2"
-  return h2
+  return h3
