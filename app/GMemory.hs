@@ -22,7 +22,6 @@ import Data.IORef
 import Data.List (find)
 import System.IO
 
-
 newtype IORT s m a v = IORT
   { unIORT :: ReaderT (IORef [PtrR a]) m v
   } deriving (Functor, Applicative, Monad)
@@ -36,7 +35,7 @@ type Bytes = Int
 data PtrR a = PtrR { ptr        :: Ptr a
                    , ref_count  :: IORef Integer
                    , block_size :: Bytes
-                   , free_size  :: Bytes
+                   , free_size  :: IORef Bytes
                    }
 
 instance Eq (PtrR a) where
@@ -55,8 +54,9 @@ free_ptr (PtrR {ptr = ptr, ref_count = refcount}) = do
 
 new_ptr :: Ptr a -> IO (PtrR a)
 new_ptr ptr = do
-  ioref <- newIORef 1
-  return $ PtrR {ptr = ptr, ref_count = ioref, block_size = 0, free_size = 0}
+  rc <- newIORef 1
+  fs <- newIORef 0
+  return $ PtrR {ptr = ptr, ref_count = rc, block_size = 0, free_size = fs}
 
 eq_ptr :: Ptr a -> PtrR a -> Bool
 eq_ptr ptr1 (PtrR {ptr = ptr2})= ptr1 == ptr2
@@ -140,11 +140,12 @@ newMemBlock bytes = IORT r'
       pointers <- ask
       ptr' <- liftRIO $ new_ptr ptr
       liftRIO $ modifyIORef pointers (ptr':)
-      ioref <- liftRIO $ newIORef 1
+      rc <- liftRIO $ newIORef 1
+      fs <- liftRIO $ newIORef bytes
       return $ SPtr (PtrR { ptr = ptr
-                          , ref_count = ioref
+                          , ref_count = rc
                           , block_size = bytes
-                          , free_size  = bytes})
+                          , free_size  = fs})
 
 -- mimics implicit region subtyping
 -- MonadRaise m1 m2 holds when either 
@@ -189,7 +190,7 @@ when reading something of type a
 block_size >= size_of a
 
 when writing something of type a
-block_size >= free_size + size_of a
+free_size >= size_of a
 -}
 
 readInt :: (MonadRaise m1 m2, RMonadIO m2) => SPtr m1 Int -> m2 Int
@@ -199,7 +200,11 @@ readInt (SPtr (PtrR {ptr = ptr, block_size = s, free_size = fs})) = do
 
 writeInt :: (MonadRaise m1 m2, RMonadIO m2) => SPtr m1 Int -> Int -> m2 ()
 writeInt (SPtr (PtrR {ptr = ptr, block_size = s, free_size = fs})) n = do
-  assert (s >= fs + sizeOf n) (return ())
+  fs' <- liftRIO $ readIORef fs
+  liftRIO $ assert (fs' >= sizeOf n) (do
+                                         modifyIORef fs (\f -> f - sizeOf n)
+                                         return ()
+                                     )
   liftRIO $ poke ptr n
 
 report :: (RMonadIO m) => String -> m ()
@@ -217,11 +222,11 @@ resetRegion can be faked with fillBytes which is just a wrapper around `memset`
 -}
 
 
-foo = runSIO $ do
-  x <- newMemBlock (0)
-  writeInt x 5
-  --m <- readInt x
-  --return m
+-- foo = runSIO $ do
+--   x <- newMemBlock (0)
+--   writeInt x 5
+--   --m <- readInt x
+--   --return m
 
 
 
