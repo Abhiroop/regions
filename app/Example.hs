@@ -9,3 +9,7 @@ foo = runSIO $ do
   y <- readInt j
   return y
 
+bar = runSIO $ do
+  x <- newMemBlock 80
+  y <- readInt x
+  return y
